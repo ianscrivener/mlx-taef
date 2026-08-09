@@ -8,20 +8,22 @@ from mlx_taef.kernels._types import (
     LatentSpec,
     MfluxBinding,
     ModelKernel,
+    Role,
     UnpackContext,
     WeightSource,
 )
 from mlx_taef.kernels.flux import TAEF1, TAEF2
+from mlx_taef.kernels.krea2 import KREA2
+from mlx_taef.kernels.qwen import QWEN_IMAGE
 from mlx_taef.kernels.sd import TAESD, TAESDXL
 from mlx_taef.kernels.zimage import ZIMAGE
 
-# Per-kernel arch builder knobs that are NOT on the shared ArchSpec record.
-MIDBLOCK_GN: MappingProxyType[str, bool] = MappingProxyType(
-    {"taesd": False, "taesdxl": False, "taef1": False, "taef2": True, "zimage": False}
-)
-
-_ALL = (TAESD, TAESDXL, TAEF1, TAEF2, ZIMAGE)
+_ALL = (TAESD, TAESDXL, TAEF1, TAEF2, ZIMAGE, QWEN_IMAGE, KREA2)
 KERNELS: MappingProxyType[str, ModelKernel] = MappingProxyType({k.name: k for k in _ALL})
+MIDBLOCK_GN: MappingProxyType[str, bool] = MappingProxyType(
+    {name: kernel.midblock_gn for name, kernel in KERNELS.items()}
+)
+"""Compatibility view; architecture construction reads `ModelKernel.midblock_gn`."""
 
 
 def get_kernel(name: str) -> ModelKernel:
@@ -39,6 +41,7 @@ __all__ = [
     "LatentSpec",
     "MfluxBinding",
     "ModelKernel",
+    "Role",
     "UnpackContext",
     "WeightSource",
     "get_kernel",

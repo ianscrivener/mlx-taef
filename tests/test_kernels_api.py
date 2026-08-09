@@ -43,5 +43,11 @@ def test_zimage_class_binds_zimage_kernel():
 
     assert ZImage._kernel is get_kernel("zimage")
     assert ZImage().decoder.layers[1].weight.shape[-1] == 16
-    out = ZImage.from_kernel  # the generic ctor is inherited
-    assert callable(out)
+    # `from_kernel` must be the inherited classmethod, not a ZImage override.
+    assert ZImage.from_kernel.__func__ is Taef.from_kernel.__func__
+
+
+def test_krea2_class_binds_krea2_kernel():
+    from mlx_taef import Krea2
+
+    assert Krea2._kernel is get_kernel("krea2")

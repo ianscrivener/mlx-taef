@@ -9,6 +9,8 @@ this file was rewritten.
 """
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +24,7 @@ def _make_vs_vae_report(
 ) -> dict[str, Any]:
     """Build a report shaped like run_showcase.py's `taef2_vs_vae` output."""
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": "2026-05-26T00:00:00Z",
         "scenarios": {
             "taef2_vs_vae": {
@@ -46,7 +48,7 @@ def _make_vs_vae_report(
 
 def _make_live_report(elapsed_s: float, *, peak_memory_gb: float = 10.0) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": "2026-05-26T00:00:00Z",
         "scenarios": {
             "live_preview": {
@@ -67,7 +69,7 @@ def _make_combined_report(
     """Build a report shaped like run_showcase.py's `combined` scenario,
     which carries the TeaCache `skipped_count` the integration headline depends on."""
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": "2026-05-26T00:00:00Z",
         "scenarios": {
             "combined": {
@@ -138,6 +140,27 @@ def test_main_exit_zero_on_clean_diff(tmp_path: Path) -> None:
     assert main([str(old_path), str(new_path)]) == 0
 
 
+def test_documented_direct_script_invocation_can_import_sibling_module(tmp_path: Path) -> None:
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps(_make_vs_vae_report(0.1, 0.85)))
+    repo_root = Path(__file__).parent.parent
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "scripts" / "diff_showcase_report.py"),
+            str(report),
+            str(report),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_main_exit_nonzero_on_regression(tmp_path: Path) -> None:
     from scripts.diff_showcase_report import main
 
@@ -147,6 +170,63 @@ def test_main_exit_nonzero_on_regression(tmp_path: Path) -> None:
     new_path.write_text(json.dumps(_make_vs_vae_report(0.2, 0.85)))  # 100% slower
 
     assert main([str(old_path), str(new_path)]) == 1
+
+
+def test_main_rejects_unknown_schema_before_diff(tmp_path: Path) -> None:
+    import pytest
+    from scripts.diff_showcase_report import main
+
+    from mlx_taef.errors import SchemaVersionError
+
+    old_path = tmp_path / "old.json"
+    new_path = tmp_path / "new.json"
+    old_path.write_text(json.dumps({"schema_version": 99, "scenarios": {}}))
+    new_path.write_text(json.dumps({"schema_version": 2, "scenarios": {}}))
+
+    with pytest.raises(SchemaVersionError, match="schema_version"):
+        main([str(old_path), str(new_path)])
+
+
+def test_load_report_migrates_schema_v1_metadata_and_preview_counts(tmp_path: Path) -> None:
+    from scripts.run_showcase import _load_report
+
+    old = tmp_path / "old.json"
+    old.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "hardware": {"dtype": "bf16"},
+                "isolation": "subprocess-per-rep",
+                "scenarios": {
+                    "live_preview": {
+                        "status": "ok",
+                        "preview_paths": ["step00.webp", "step01.webp"],
+                    }
+                },
+            }
+        )
+    )
+
+    migrated = _load_report(old)
+
+    assert migrated["schema_version"] == 2
+    assert migrated["hardware"]["generation_dtype"] == "bf16"
+    assert migrated["hardware"]["taef_decode_dtype"] == "float32"
+    assert "dtype" not in migrated["hardware"]
+    assert migrated["scenarios"]["live_preview"]["preview_count"] == 2
+
+
+def test_diff_flags_preview_count_drop() -> None:
+    from scripts.diff_showcase_report import diff_reports
+
+    old = _make_live_report(elapsed_s=10.0)
+    new = _make_live_report(elapsed_s=10.0)
+    old["scenarios"]["live_preview"]["preview_count"] = 4
+    new["scenarios"]["live_preview"]["preview_count"] = 2
+
+    regressions = diff_reports(old, new)
+
+    assert [r["kind"] for r in regressions] == ["preview-count-drop"]
 
 
 def test_committed_showcase_report_against_itself_finds_no_regression() -> None:
@@ -342,3 +422,68 @@ def test_peak_memory_field_removed_flagged_for_scenario() -> None:
     assert len(flagged) == 1
     assert flagged[0]["scenario"] == "live_preview"
     assert flagged[0]["condition"] == "(scenario)"
+
+
+def test_whole_scenario_missing_from_new_report_is_flagged() -> None:
+    """A scenario present in the baseline but absent from the new report must be flagged —
+    otherwise a partial re-run silently passes as 'no regressions'."""
+    from scripts.diff_showcase_report import diff_reports
+
+    old = {"scenarios": {"taef1_vs_vae": {"ssim_median": 0.95}, "live_preview": {"elapsed_s": 2.0}}}
+    new = {"scenarios": {"taef1_vs_vae": {"ssim_median": 0.95}}}  # live_preview dropped
+    regs = diff_reports(old, new)
+    kinds = {(r["kind"], r["scenario"]) for r in regs}
+    assert ("scenario-missing", "live_preview") in kinds
+
+
+def test_ssim_median_missing_from_new_report_is_flagged() -> None:
+    """A dropped ssim_median (baseline had it, new omits it) must be flagged, matching the
+    existing peak-memory-missing guard."""
+    from scripts.diff_showcase_report import diff_reports
+
+    old = {"scenarios": {"taef1_vs_vae": {"ssim_median": 0.95}}}
+    new = {"scenarios": {"taef1_vs_vae": {}}}  # ssim_median gone
+    regs = diff_reports(old, new)
+    assert any(r["kind"] == "ssim-missing" for r in regs)
+
+
+def test_condition_median_seconds_missing_from_new_report_is_flagged() -> None:
+    """A dropped per-condition median_seconds (baseline had it, new omits it) must flag —
+    otherwise a latency field can vanish and still pass as 'no regressions'."""
+    from scripts.diff_showcase_report import diff_reports
+
+    old = {"scenarios": {"taef1_vs_vae": {"taef": {"median_seconds": 0.18}}}}
+    new = {"scenarios": {"taef1_vs_vae": {"taef": {}}}}  # median_seconds gone
+    regs = diff_reports(old, new)
+    assert any(r["kind"] == "wallclock-missing" for r in regs)
+
+
+def test_scenario_elapsed_s_missing_from_new_report_is_flagged() -> None:
+    """A dropped scenario-level elapsed_s (live_preview/combined) must flag too."""
+    from scripts.diff_showcase_report import diff_reports
+
+    old = {"scenarios": {"live_preview": {"elapsed_s": 2.0}}}
+    new = {"scenarios": {"live_preview": {}}}  # elapsed_s gone
+    regs = diff_reports(old, new)
+    assert any(r["kind"] == "wallclock-missing" and r["condition"] == "(scenario)" for r in regs)
+
+
+def test_migration_populates_distribution_version_fallback(tmp_path: Path) -> None:
+    """A v1 report's single mlx_taef_version feeds the v2 distribution-version field."""
+    from scripts.run_showcase import _load_report
+
+    old = tmp_path / "old.json"
+    old.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "hardware": {"dtype": "bf16", "mlx_taef_version": "0.6.2"},
+                "isolation": "subprocess-per-rep",
+                "scenarios": {},
+            }
+        )
+    )
+
+    migrated = _load_report(old)
+
+    assert migrated["hardware"]["mlx_taef_distribution_version"] == "0.6.2"

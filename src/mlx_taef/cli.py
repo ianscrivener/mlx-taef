@@ -2,14 +2,15 @@
 
 import argparse
 import logging
+import shutil
+import sys
 import time
 from pathlib import Path
 
 import mlx.core as mx
 
-from mlx_taef.api import TAEF1, TAEF2, TAESD, TAESDXL, ZImage
+from mlx_taef.api import TAEF1, TAEF2, TAESD, TAESDXL, Krea2, QwenImage, ZImage
 from mlx_taef.kernels import KERNELS
-from mlx_taef.variants import VARIANTS
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,8 @@ _BENCH_CLS_BY_NAME = {
     "taef1": TAEF1,
     "taef2": TAEF2,
     "zimage": ZImage,
+    "qwen-image": QwenImage,
+    "krea2": Krea2,
 }
 
 
@@ -30,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    convert_names = sorted(VARIANTS)  # legacy shim (kernels with a distinct convert path)
+    convert_names = sorted(KERNELS)
     bench_names = sorted(KERNELS)  # all kernels, incl. zimage
 
     p_convert = sub.add_parser("convert", help="Download upstream weights and convert to MLX")
@@ -55,20 +58,21 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _cmd_convert(args: argparse.Namespace) -> int:
-    from mlx_taef.convert import convert_hf_decoder_to_mlx, convert_hf_encoder_to_mlx
-    from mlx_taef.variants import VARIANTS
+    from mlx_taef.download import get_or_convert
 
-    config = VARIANTS[args.variant]
-    if args.role == "encoder":
-        convert_hf_encoder_to_mlx(out_path=args.dst, config=config)
-    else:
-        convert_hf_decoder_to_mlx(out_path=args.dst, config=config)
+    cached_path = get_or_convert(KERNELS[args.variant], role=args.role)
+    args.dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(cached_path, args.dst)
     print(f"Wrote {args.dst}")
     return 0
 
 
 def _cmd_info(args: argparse.Namespace) -> int:
-    weights = mx.load(str(args.path))
+    try:
+        weights = mx.load(str(args.path))
+    except (OSError, RuntimeError, ValueError) as e:
+        print(f"mlx-taef info: could not read {args.path}: {e}", file=sys.stderr)
+        return 2
     print(f"File: {args.path}")
     print(f"Total tensors: {len(weights)}")
     total_params = sum(int(w.size) for w in weights.values())  # type: ignore[misc,union-attr]
@@ -81,7 +85,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:  # pragma: no cover
 
     model = cls.from_pretrained(include_encoder=False)
     # 1024x1024 image with 8x downsample = 128x128 latent
-    latent = mx.random.normal((1, 128, 128, cls._kernel.latent.channels)).astype(mx.float16)
+    latent = mx.random.normal((1, 128, 128, cls._kernel.latent.channels)).astype(mx.float32)
     mx.eval(latent)
 
     # Warm-up
@@ -93,7 +97,7 @@ def _cmd_bench(args: argparse.Namespace) -> int:  # pragma: no cover
         mx.eval(model.decode(latent))
         times.append(time.perf_counter() - start)
     median_ms = sorted(times)[len(times) // 2] * 1000
-    print(f"{args.variant} decode median: {median_ms:.1f} ms over {len(times)} runs")
+    print(f"{args.variant} fp32 decode median: {median_ms:.1f} ms over {len(times)} runs")
     return 0
 
 

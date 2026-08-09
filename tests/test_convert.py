@@ -62,9 +62,9 @@ def test_sequential_key_to_mlx_flat_key() -> None:
 
 def test_sequential_key_to_mlx_nested_sequential() -> None:
     # Nested: "3.conv.0.weight" -> "layers.3.conv.layers.0.weight"
-    out = _sequential_key_to_mlx("3.conv.0.weight")
-    assert out.startswith("layers.")
-    assert "conv" in out
+    assert _sequential_key_to_mlx("3.conv.0.weight") == "layers.3.conv.layers.0.weight"
+    # pool branch too, so a mutation that mis-prefixes only one nesting kind is still caught.
+    assert _sequential_key_to_mlx("3.pool.1.bias") == "layers.3.pool.layers.1.bias"
 
 
 def test_build_mlx_state_dict_transposes_4d_conv_weights() -> None:
@@ -83,6 +83,31 @@ def test_build_mlx_state_dict_transposes_4d_conv_weights() -> None:
     assert w.shape == (2, 5, 7, 3)
     assert w[0, 2, 3, 1] == 42.0
     assert np.array_equal(w, np.transpose(nchw, (0, 2, 3, 1)))
+
+
+def test_build_mlx_state_dict_transposes_collision_shaped_conv_weight() -> None:
+    """Mutation: restoring the expected-shape heuristic leaves this sentinel on the wrong axis."""
+    nchw = np.zeros((2, 3, 3, 3), dtype=np.float32)
+    nchw[0, 1, 2, 0] = 42.0
+
+    out = _build_mlx_state_dict(
+        {"1.weight": nchw}, expected_shapes={"layers.1.weight": (2, 3, 3, 3)}
+    )
+    weight = np.array(out["layers.1.weight"])
+
+    assert weight[0, 2, 0, 1] == 42.0
+    assert weight[0, 1, 2, 0] == 0.0
+
+
+def test_diffusers_key_mapper_logs_and_skips_non_layers_key(caplog) -> None:
+    with caplog.at_level("DEBUG", logger="mlx_taef.convert"):
+        mapped = convert_diffusers_to_sequential(
+            {"decoder.layers.0.weight": "kept", "decoder.quant_conv.weight": "extra"},
+            role="decoder",
+        )
+
+    assert mapped == {"1.weight": "kept"}
+    assert any("quant_conv" in message for message in caplog.messages)
 
 
 def test_build_mlx_state_dict_drops_extra_source_keys() -> None:
@@ -196,3 +221,98 @@ def _flatten_param_paths(params, prefix: str = ""):
     elif hasattr(params, "shape"):
         keys.append(prefix)
     return keys
+
+
+class _RoutedThroughVerifierError(Exception):
+    """Sentinel raised by the fake pinned downloader to prove routing."""
+
+
+def _spy_verified_downloader(calls: list[tuple[object, ...]]):
+    def fake(source, filename, *, role):
+        calls.append((source.repo, source.revision, source.sha256_for(role), filename, role))
+        raise _RoutedThroughVerifierError
+
+    return fake
+
+
+def test_legacy_loader_routes_builtin_configs_through_pinned_download(monkeypatch) -> None:
+    """_load_role_state_dict uses the kernel system's pinned, sha-verified downloader."""
+    from mlx_taef.convert import _load_role_state_dict
+    from mlx_taef.kernels import KERNELS, _conversion
+    from mlx_taef.variants import TAESD_CONFIG
+
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(_conversion, "_download_and_verify", _spy_verified_downloader(calls))
+    monkeypatch.setattr(
+        "mlx_taef.convert.hf_hub_download",
+        lambda *a, **k: pytest.fail("legacy loader attempted an unpinned hf_hub_download"),
+        raising=False,
+    )
+
+    with pytest.raises(_RoutedThroughVerifierError):
+        _load_role_state_dict(TAEF2_CONFIG, role="decoder")
+    with pytest.raises(_RoutedThroughVerifierError):
+        _load_role_state_dict(TAESD_CONFIG, role="encoder")
+
+    taef2 = KERNELS["taef2"].source
+    taesd = KERNELS["taesd"].source
+    assert calls == [
+        (taef2.repo, taef2.revision, taef2.sha256_for("decoder"), taef2.filename, "decoder"),
+        (
+            taesd.repo,
+            taesd.revision,
+            taesd.sha256_for("encoder"),
+            taesd.encoder_filename,
+            "encoder",
+        ),
+    ]
+    for _, revision, digest, _, _ in calls:
+        assert revision is not None
+        assert digest is not None
+
+
+def test_legacy_loader_uses_adhoc_unpinned_source_for_custom_configs(monkeypatch) -> None:
+    """A hand-built config (unknown name, or kernel name with a different repo) gets an
+    ad-hoc unpinned source instead of another kernel's pins."""
+    from mlx_taef.convert import _load_role_state_dict
+    from mlx_taef.kernels import _conversion
+    from mlx_taef.variants import TaesdVariantConfig
+
+    custom = TaesdVariantConfig(
+        name="custom",
+        latent_channels=4,
+        arch_variant=None,
+        key_format="upstream",
+        hf_repo="example/custom",
+        hf_filename=None,
+        hf_decoder_filename="dec.safetensors",
+        hf_encoder_filename="enc.safetensors",
+    )
+    fork = TaesdVariantConfig(
+        name="taef2",
+        latent_channels=32,
+        arch_variant="flux_2",
+        key_format="diffusers",
+        hf_repo="example/taef2-fork",
+        hf_filename="taef2.safetensors",
+        hf_decoder_filename=None,
+        hf_encoder_filename=None,
+    )
+
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(_conversion, "_download_and_verify", _spy_verified_downloader(calls))
+    monkeypatch.setattr(
+        "mlx_taef.convert.hf_hub_download",
+        lambda *a, **k: pytest.fail("legacy loader attempted an unpinned hf_hub_download"),
+        raising=False,
+    )
+
+    with pytest.raises(_RoutedThroughVerifierError):
+        _load_role_state_dict(custom, role="decoder")
+    with pytest.raises(_RoutedThroughVerifierError):
+        _load_role_state_dict(fork, role="decoder")
+
+    assert calls == [
+        ("example/custom", None, None, "dec.safetensors", "decoder"),
+        ("example/taef2-fork", None, None, "taef2.safetensors", "decoder"),
+    ]

@@ -28,9 +28,13 @@ import datetime
 import hashlib
 import json
 import logging
+import os
 import platform
+import subprocess
 import sys
+import threading
 import time
+from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -47,12 +51,14 @@ from mlx_taef.errors import (  # noqa: E402
     FixtureLatentMissingError,
     MlxTeacacheNotInstalledError,
     SchemaVersionError,
+    TaefError,
 )
+from scripts.bench_decode import _repo_relative  # noqa: E402
 
 logger = logging.getLogger("mlx_taef.showcase")
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _import_apply_teacache() -> Any:
@@ -89,9 +95,20 @@ def _build_argparser() -> argparse.ArgumentParser:
         help=(
             "Don't move existing _artifacts/showcase/ to ~/.Trash before "
             "starting. By default, prior bench output is preserved in "
-            "Trash with a dated suffix per the CLAUDE.md 'never rm' rule."
+            "Trash with a dated suffix (generated artifacts are moved to the Trash, never deleted)."
         ),
     )
+    parser.add_argument(
+        "--no-lpips",
+        action="store_true",
+        help=(
+            "Skip LPIPS scoring in vs-VAE scenarios (SSIM only). Use when the "
+            "'lpips' package (fixtures group) isn't installed, or to avoid the "
+            "torchvision AlexNet weight download."
+        ),
+    )
+    parser.add_argument("--live-worker", choices=sorted(_LIVE_SCENARIOS), help=argparse.SUPPRESS)
+    parser.add_argument("--live-result", type=Path, help=argparse.SUPPRESS)
     return parser
 
 
@@ -99,7 +116,7 @@ def _move_prior_artifacts_to_trash(artifacts_dir: Path) -> Path | None:
     """Move an existing artifacts dir to ~/.Trash with a dated tag.
 
     Returns the new Trash path on success, None if there was nothing to
-    move. Mirrors the CLAUDE.md 'never rm' guardrail — re-running the
+    move. Prior bench output is moved to the Trash, never deleted — re-running the
     bench would otherwise silently overwrite multi-minute prior work.
     """
     if not artifacts_dir.exists():
@@ -175,6 +192,11 @@ def _vs_vae_scenario(
             "ssim_median": 0.0,
         }
     )
+    lpips_result = (
+        {"lpips_per_pair": [], "lpips_median": None}
+        if args.no_lpips or not (taef_webps and vae_webps)
+        else _compute_lpips(refs=vae_webps, cands=taef_webps)
+    )
 
     return {
         "status": "ok",
@@ -182,6 +204,7 @@ def _vs_vae_scenario(
         "taef": taef_result,
         "vanilla_vae": vae_result,
         **ssim,
+        **lpips_result,
     }
 
 
@@ -310,10 +333,11 @@ def _live_generation(
     applied_cap_gb: int | None = None
     if args.cap_gb is not None:
         device_wired_gb, _ = compute_safe_caps_gb()
-        wired_gb = min(args.cap_gb, device_wired_gb) if device_wired_gb else args.cap_gb
-        mem_gb = min(wired_gb + 2, 22)
-        mx.set_wired_limit(wired_gb * 1024**3)
-        mx.set_memory_limit(mem_gb * 1024**3)
+        wired_gb = _resolve_override_wired_gb(args.cap_gb, device_wired_gb)
+        if wired_gb is not None:
+            mem_gb = min(wired_gb + 2, 22)
+            mx.set_wired_limit(wired_gb * 1024**3)
+            mx.set_memory_limit(mem_gb * 1024**3)
         applied_cap_gb = wired_gb
     else:
         applied_cap_gb, _ = install_memory_caps()
@@ -341,6 +365,7 @@ def _live_generation(
         save_to=save_dir / f"{scenario_dir}.webp",
         latent_height=height // latent_height_divisor,
         latent_width=width // latent_width_divisor,
+        on_error="raise",
     )
     flux.callbacks.register(callback)
 
@@ -358,10 +383,8 @@ def _live_generation(
 
     # Save the final full-VAE image too.
     final_path = save_dir / f"{scenario_dir}_final.webp"
-    try:
-        generated.image.save(final_path, "WEBP", quality=92)
-    except Exception as e:  # pragma: no cover
-        logger.warning("could not save final image: %s", e)
+    generated.image.save(final_path, "WEBP", quality=92)
+    _validate_live_artifacts(callback.saved_paths, final_path, expected_count=num_steps)
 
     if handle is not None:
         teacache_stats = {
@@ -372,7 +395,7 @@ def _live_generation(
 
     return {
         "status": "ok",
-        "scenario_dir": str(save_dir),
+        "scenario_dir": _repo_relative(save_dir),
         "elapsed_s": elapsed_s,
         "peak_memory_gb": peak_gb,
         "applied_cap_gb": applied_cap_gb,
@@ -382,10 +405,22 @@ def _live_generation(
         "prompt": prompt,
         "height": height,
         "width": width,
-        "preview_paths": [str(p) for p in callback.saved_paths],
-        "final_path": str(final_path),
+        "preview_paths": [_repo_relative(p) for p in callback.saved_paths],
+        "preview_count": len(callback.saved_paths),
+        "final_path": _repo_relative(final_path),
         "teacache": teacache_stats,
     }
+
+
+def _validate_live_artifacts(
+    preview_paths: list[Path], final_path: Path, *, expected_count: int
+) -> None:
+    """Require a complete, non-empty preview gallery and final image."""
+    if len(preview_paths) != expected_count:
+        raise TaefError(f"expected {expected_count} preview frames, got {len(preview_paths)}")
+    for path in [*preview_paths, final_path]:
+        if not path.is_file() or path.stat().st_size == 0:
+            raise TaefError(f"missing or empty live artifact: {path}")
 
 
 _SCENARIO_DISPATCH = {
@@ -396,6 +431,26 @@ _SCENARIO_DISPATCH = {
     "zimage_live_preview": _run_zimage_live_preview,
     "combined": _run_combined,
 }
+
+_LIVE_SCENARIOS = frozenset({"live_preview", "zimage_live_preview", "combined"})
+_LIVE_WALL_BUDGET_S = 3300.0
+_MEMORY_HEADROOM_BYTES = 4 * 1024**3
+
+
+def _all_scenario_order() -> list[str]:
+    """Scenario run order for `--scenario all` (a single scenario name is unaffected).
+
+    Live scenarios run first. Each vs-VAE scenario builds LPIPS's torch+AlexNet model
+    (~730 MB resident, never returned to the OS) in THIS orchestrator process; a live
+    scenario's watchdog computes its memory ceiling from the device's total
+    `memory_size`, so running vs-VAE first would leave the live subprocess (largest:
+    zimage_live_preview) with ~730 MB less real headroom than that math assumes.
+    Derived from `_SCENARIO_DISPATCH`/`_LIVE_SCENARIOS` rather than a hardcoded list so a
+    newly-added scenario is placed correctly without touching this function.
+    """
+    live = [name for name in _SCENARIO_DISPATCH if name in _LIVE_SCENARIOS]
+    vs_vae = [name for name in _SCENARIO_DISPATCH if name not in _LIVE_SCENARIOS]
+    return live + vs_vae
 
 
 # ---------------------------------------------------------------------------
@@ -424,13 +479,15 @@ def _build_hardware_metadata() -> dict[str, Any]:
         "machine": platform.machine(),
         "os": f"{platform.system()} {platform.release()}",
         "git_sha": _detect_git_sha(),
-        "mlx_taef_version": _safe_version("mlx-taef") or "0.0.0+dev",
+        "mlx_taef_version": _detect_source_version(),
+        "mlx_taef_distribution_version": _safe_version("mlx-taef") or "unknown",
         "mlx_teacache_version": _safe_version("mlx-teacache"),
         "mflux_version": _safe_version("mflux") or "unknown",
         "mlx_version": _safe_version("mlx") or "unknown",
         "python_version": platform.python_version(),
         "quantize": 4,
-        "dtype": "bf16",
+        "generation_dtype": "bf16",
+        "taef_decode_dtype": "float32",
     }
 
 
@@ -496,8 +553,50 @@ def _detect_git_sha() -> str | None:
     return None
 
 
+def _detect_source_version() -> str:
+    """Return a git-derived version tied to the source being benchmarked."""
+    try:
+        result = subprocess.run(
+            ["git", "describe", "--tags", "--long", "--always"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+            cwd=_REPO_ROOT,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover
+        pass
+    return "unknown"
+
+
+def _migrate_report_v1_to_v2(data: dict[str, Any]) -> dict[str, Any]:
+    """Deterministically adapt the committed v0.6.2 report to schema v2."""
+    migrated = dict(data)
+    hardware = dict(migrated.get("hardware", {}))
+    if "dtype" in hardware:
+        hardware.setdefault("generation_dtype", hardware.pop("dtype"))
+    hardware.setdefault("taef_decode_dtype", "float32")
+    hardware.setdefault(
+        "mlx_taef_distribution_version", hardware.get("mlx_taef_version", "unknown")
+    )
+    migrated["hardware"] = hardware
+    scenarios: dict[str, Any] = {}
+    for name, raw_scenario in migrated.get("scenarios", {}).items():
+        scenario = dict(raw_scenario) if isinstance(raw_scenario, dict) else raw_scenario
+        if isinstance(scenario, dict) and isinstance(scenario.get("preview_paths"), list):
+            scenario.setdefault("preview_count", len(scenario["preview_paths"]))
+        scenarios[name] = scenario
+    migrated["scenarios"] = scenarios
+    migrated["schema_version"] = SCHEMA_VERSION
+    return migrated
+
+
 def _load_report(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text())
+    if data.get("schema_version") == 1:
+        return _migrate_report_v1_to_v2(data)
     if data.get("schema_version") != SCHEMA_VERSION:
         raise SchemaVersionError(
             f"unknown schema_version: got {data.get('schema_version')!r}, expected {SCHEMA_VERSION}"
@@ -508,6 +607,110 @@ def _load_report(path: Path) -> dict[str, Any]:
 def _write_report(path: Path, report: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, indent=2))
+
+
+def _live_watchdog_breach_reason(
+    *,
+    active_bytes: int,
+    ceiling_bytes: int,
+    elapsed_s: float,
+    wall_budget_s: float,
+) -> str | None:
+    """Return the first live-worker safety limit that has been breached."""
+    if active_bytes >= ceiling_bytes:
+        return "memory_ceiling"
+    if elapsed_s > wall_budget_s:
+        return "wall_budget"
+    return None
+
+
+def _commit_watchdog_abort(
+    result_path: Path, payload: dict[str, Any], *, stop_event: threading.Event
+) -> None:
+    """Durably record a watchdog abort, then kill the worker with exit code 70.
+
+    Skips entirely when generation already signalled completion (`stop_event` set),
+    so a breach observed in the same instant can't overwrite a real result. The
+    exit still fires even if the abort record can't be written — dying without an
+    artifact beats surviving past the safety ceiling.
+    """
+    if stop_event.is_set():
+        return
+    try:
+        _write_report(result_path, payload)
+    finally:
+        os._exit(70)
+
+
+def _resolve_override_wired_gb(cap_gb: int, device_wired_gb: int) -> int | None:
+    """Clamp an operator `--cap-gb` override to the device's safe wired ceiling.
+
+    Returns None when the device reports no Metal working-set size — in that case
+    no wired limit is applied at all rather than trusting the raw override.
+    """
+    if not device_wired_gb:
+        return None
+    return min(cap_gb, device_wired_gb)
+
+
+class _LiveWatchdog:
+    """Cooperatively stop a live-worker watchdog thread after generation."""
+
+    def __init__(self, stop_event: threading.Event, thread: threading.Thread) -> None:
+        self._stop_event = stop_event
+        self._thread = thread
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._thread.join(timeout=5)
+
+
+def _install_live_watchdog(
+    result_path: Path,
+    scenario: str,
+    *,
+    interval_s: float = 0.5,
+    wall_budget_s: float = _LIVE_WALL_BUDGET_S,
+) -> _LiveWatchdog:
+    """Abort a live worker before it exhausts unified memory or its wall budget."""
+    import mlx.core as mx
+
+    memory_size = int(mx.device_info().get("memory_size", 0))
+    if memory_size <= _MEMORY_HEADROOM_BYTES:
+        raise TaefError(f"could not establish a safe memory ceiling from {memory_size} bytes")
+    ceiling_bytes = memory_size - _MEMORY_HEADROOM_BYTES
+    stop_event = threading.Event()
+    started = time.monotonic()
+
+    def _watch() -> None:
+        while not stop_event.wait(interval_s):
+            elapsed_s = time.monotonic() - started
+            active_bytes = int(mx.get_active_memory())
+            reason = _live_watchdog_breach_reason(
+                active_bytes=active_bytes,
+                ceiling_bytes=ceiling_bytes,
+                elapsed_s=elapsed_s,
+                wall_budget_s=wall_budget_s,
+            )
+            if reason is None:
+                continue
+            _commit_watchdog_abort(
+                result_path,
+                {
+                    "status": "aborted",
+                    "scenario": scenario,
+                    "reason": reason,
+                    "active_memory_bytes": active_bytes,
+                    "ceiling_bytes": ceiling_bytes,
+                    "elapsed_s": elapsed_s,
+                    "wall_budget_s": wall_budget_s,
+                },
+                stop_event=stop_event,
+            )
+
+    thread = threading.Thread(target=_watch, name=f"{scenario}-watchdog", daemon=True)
+    thread.start()
+    return _LiveWatchdog(stop_event, thread)
 
 
 # ---------------------------------------------------------------------------
@@ -580,8 +783,160 @@ def _compute_ssim(refs: list[Path], cands: list[Path]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# LPIPS (orchestrator-side, after webps are saved)
+# ---------------------------------------------------------------------------
+
+
+def _require_lpips() -> Any:
+    """Lazily import the `lpips` package, raising a clear error if unavailable.
+
+    `lpips` is intentionally NOT a runtime or `test`-group dependency — it drags
+    torch — so it lives in the `fixtures` group only (see pyproject.toml). This
+    keeps CI's `--group test` install torch-free while still letting the
+    showcase report LPIPS when the operator has opted in.
+    """
+    try:
+        import lpips
+        import torch  # noqa: F401  (imported to surface an absent-torch failure here too)
+    except ImportError as e:
+        raise TaefError(
+            "LPIPS requested but the 'lpips' package is not installed; run "
+            "`uv sync --group fixtures` or pass --no-lpips"
+        ) from e
+    return lpips
+
+
+def _build_lpips_score_fn() -> Callable[[Path, Path], float]:
+    """Build the canonical LPIPS(net="alex") scorer.
+
+    Downloads ImageNet-pretrained torchvision AlexNet weights on first use
+    (network I/O) — never use `pnet_rand=True`, which skips the download but is
+    no longer canonical LPIPS.
+    """
+    lpips = _require_lpips()
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    loss_fn = lpips.LPIPS(net="alex")
+
+    def _to_tensor(path: Path) -> torch.Tensor:
+        img = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
+        img = img * 2.0 - 1.0  # LPIPS expects CHW in [-1, 1]
+        return torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)
+
+    def _score(ref: Path, cand: Path) -> float:
+        with torch.no_grad():
+            return float(loss_fn(_to_tensor(ref), _to_tensor(cand)))
+
+    return _score
+
+
+def _compute_lpips(
+    refs: list[Path],
+    cands: list[Path],
+    *,
+    score_fn: Callable[[Path, Path], float] | None = None,
+) -> dict[str, Any]:
+    """Compute LPIPS for each (ref, cand) pair in the cross-product.
+
+    Mirrors `_compute_ssim`'s pairing (every ref against every cand, not a
+    zip). `score_fn` is the injectable model boundary: offline tests pass a
+    deterministic fake; `score_fn=None` builds the canonical, network-dependent
+    scorer via `_build_lpips_score_fn`.
+    """
+    if score_fn is None:
+        score_fn = _build_lpips_score_fn()
+
+    per_pair: list[float] = [score_fn(ref, cand) for ref in refs for cand in cands]
+
+    import statistics
+
+    return {
+        "lpips_per_pair": per_pair,
+        "lpips_median": statistics.median(per_pair) if per_pair else None,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+
+def _run_live_scenario_subprocess(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
+    """Run one live scenario in a fresh process and load its durable partial result."""
+    partial_dir = args.report.parent / f".{args.report.stem}-partials"
+    partial_dir.mkdir(parents=True, exist_ok=True)
+    result_path = partial_dir / f"{scenario}.json"
+    _write_report(result_path, {"status": "running", "scenario": scenario})
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--live-worker",
+        scenario,
+        "--live-result",
+        str(result_path),
+        "--no-trash-prior",
+    ]
+    if args.cap_gb is not None:
+        command.extend(["--cap-gb", str(args.cap_gb)])
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=3600,
+    )
+    if completed.returncode != 0:
+        try:
+            partial = json.loads(result_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            partial = None
+        if isinstance(partial, dict) and partial.get("status") == "aborted":
+            raise TaefError(
+                f"live scenario worker {scenario!r} aborted: {partial.get('reason', 'unknown')} "
+                f"(active={partial.get('active_memory_bytes')} bytes, "
+                f"ceiling={partial.get('ceiling_bytes')} bytes, "
+                f"elapsed={partial.get('elapsed_s')}s)"
+            )
+        raise TaefError(
+            f"live scenario worker {scenario!r} failed with exit {completed.returncode}: "
+            f"{completed.stderr[-1000:]}"
+        )
+    if not result_path.exists():
+        raise TaefError(f"live scenario worker {scenario!r} produced no result at {result_path}")
+    result: dict[str, Any] = json.loads(result_path.read_text())
+    return result
+
+
+def _run_scenarios(
+    scenarios_to_run: list[str],
+    args: argparse.Namespace,
+    report: dict[str, Any],
+) -> int:
+    """Run each scenario, recording an error entry (not aborting) if one raises.
+
+    Write the report to disk after EACH scenario so a later failure or interruption
+    never discards results already computed (subprocess-per-rep runs are minutes each).
+    """
+    failures = 0
+    for scenario in scenarios_to_run:
+        try:
+            if scenario in _LIVE_SCENARIOS:
+                result = _run_live_scenario_subprocess(scenario, args)
+            else:
+                result = _SCENARIO_DISPATCH[scenario](args)
+            report["scenarios"][scenario] = result
+        except Exception as e:  # noqa: BLE001, RUF100 - deliberate broad catch per spec
+            failures += 1
+            logger.warning("scenario %s failed: %s", scenario, e)
+            report["scenarios"][scenario] = {
+                "status": "error",
+                "error_type": type(e).__name__,
+                "reason": str(e),
+            }
+        _write_report(args.report, report)
+    return failures
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -589,33 +944,35 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_argparser()
     args = parser.parse_args(argv)
 
+    if args.live_worker is not None:
+        if args.live_result is None:
+            parser.error("--live-result is required with --live-worker")
+        watchdog = _install_live_watchdog(args.live_result, args.live_worker)
+        try:
+            result = _SCENARIO_DISPATCH[args.live_worker](args)
+        finally:
+            watchdog.stop()
+        _write_report(args.live_result, result)
+        return 0
+
     trashed = None
     if not args.no_trash_prior:
         trashed = _move_prior_artifacts_to_trash(_ARTIFACTS_DIR)
 
     report: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
-        "generated_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "hardware": _build_hardware_metadata(),
-        "isolation": "subprocess-per-rep",
-        "prior_artifacts_moved_to": str(trashed) if trashed else None,
+        "isolation": "subprocess-per-condition",
+        "prior_artifacts_moved_to": trashed.name if trashed else None,
         "scenarios": {},
     }
 
-    scenarios_to_run = (
-        list(_SCENARIO_DISPATCH.keys()) if args.scenario == "all" else [args.scenario]
-    )
+    scenarios_to_run = _all_scenario_order() if args.scenario == "all" else [args.scenario]
 
-    for scenario in scenarios_to_run:
-        try:
-            report["scenarios"][scenario] = _SCENARIO_DISPATCH[scenario](args)
-        except NotImplementedError as e:
-            logger.warning("scenario %s skipped: %s", scenario, e)
-            report["scenarios"][scenario] = {"status": "not_implemented", "reason": str(e)}
-
-    _write_report(args.report, report)
+    failures = _run_scenarios(scenarios_to_run, args, report)
     print(f"Wrote {args.report}")
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ import statistics
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,18 @@ if str(_REPO_ROOT) not in sys.path:
 from mlx_taef.errors import TaefError  # noqa: E402  (after sys.path tweak)
 from mlx_taef.variants import get_memory_cap_hint  # noqa: E402
 from scripts._caps import FULL_VAE_CAP_GB  # noqa: E402
+
+
+def _repo_relative(path: Path) -> str:
+    """Render an artifact path repo-relative for reports; foreign paths keep only the name.
+
+    Committed reports must not carry absolute paths (they leak the local home directory).
+    """
+    try:
+        return str(path.resolve().relative_to(_REPO_ROOT))
+    except ValueError:
+        return path.name
+
 
 SENTINEL_PREFIX = "::BENCH_RESULT::"
 
@@ -77,13 +90,8 @@ def _build_argparser() -> argparse.ArgumentParser:
 
 def _resolve_cap_gb(*, condition: str, flux_variant: str = "flux2-klein-base-4b") -> int | None:
     """Per-condition cap policy. See spec Section 3 'Per-condition cap policy'."""
-    if condition in ("taef1", "taef2"):
+    if condition in ("taef1", "taef2", "zimage"):
         return get_memory_cap_hint(condition)
-    if condition == "zimage":
-        # Route via the registry — the legacy shim raises on "zimage".
-        from mlx_taef.kernels import KERNELS
-
-        return KERNELS["zimage"].memory_cap_hint_gb
     if condition == "vanilla_vae":
         return FULL_VAE_CAP_GB[flux_variant]
     raise TaefError(f"unknown condition: {condition!r}")
@@ -118,6 +126,27 @@ def _parse_worker_stdout(stdout: str) -> dict[str, Any]:
             f"payload was {payload_str[:200]!r}"
         ) from e
     return payload
+
+
+def _watchdog_abort_path(save_to: Path) -> Path:
+    """Where this rep's watchdog abort artifact would be written, if any.
+
+    Sits next to the rep's webp output rather than overloading the sentinel/JSON-report
+    plumbing, so a worker that dies via os._exit() (skipping the print of a sentinel
+    line) still leaves an honest, discoverable record.
+    """
+    return save_to.with_name(save_to.stem + ".watchdog_abort.json")
+
+
+def _worker_wall_budget_s(condition: str, *, margin_s: float = 30.0) -> float:
+    """Watchdog wall budget for `condition`'s worker.
+
+    Strictly under the orchestrator's subprocess.run(timeout=...) for that condition, so
+    a wall-budget breach is reachable (the watchdog's own thread can report
+    `reason="wall_budget"` with an honest artifact) instead of the subprocess timeout
+    always firing first with no artifact at all.
+    """
+    return _SUBPROCESS_TIMEOUT_S.get(condition, 600) - margin_s
 
 
 def _run_one_rep(
@@ -160,6 +189,24 @@ def _run_one_rep(
         }
 
     if proc.returncode != 0:
+        abort_path = _watchdog_abort_path(save_to)
+        if abort_path.exists():
+            try:
+                abort_payload = json.loads(abort_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                abort_payload = None
+            if isinstance(abort_payload, dict) and abort_payload.get("status") == "aborted":
+                return {
+                    "condition": condition,
+                    "rep": rep,
+                    "status": "failed",
+                    "error": (
+                        f"watchdog aborted: {abort_payload.get('reason', 'unknown')} "
+                        f"(active={abort_payload.get('active_memory_bytes')} bytes, "
+                        f"ceiling={abort_payload.get('ceiling_bytes')} bytes, "
+                        f"elapsed={abort_payload.get('elapsed_s')}s)"
+                    ),
+                }
         # Cap rejected at startup, OOM, jetsam, etc. Parse stderr for hints.
         return {
             "condition": condition,
@@ -217,8 +264,11 @@ def _run_orchestrator(
         else:
             successes.append(result)
 
-    if not successes:
-        raise TaefError(f"all reps failed for condition={condition}: {failures}")
+    if failures:
+        failure_summary = (
+            "all reps failed" if len(failures) == reps else f"{len(failures)} of {reps} reps failed"
+        )
+        raise TaefError(f"{failure_summary} for condition={condition}: {failures}")
 
     per_rep_seconds = [r["elapsed_s"] for r in successes]
     per_rep_peak = [r.get("peak_memory_gb", 0.0) for r in successes]
@@ -237,6 +287,7 @@ def _run_orchestrator(
         "per_rep_peak_memory_gb": per_rep_peak,
         "median_peak_memory_gb": statistics.median(per_rep_peak),
         "image_path": str(successes[-1].get("image_path", "")),
+        # Always [] here — any failure raises above. Kept so the report shape is stable.
         "per_rep_failures": failures,
     }
 
@@ -273,8 +324,14 @@ def _install_memory_caps(applied_cap_gb: int | None) -> int:
     return wired_gb
 
 
-def _decode_taef1(latent: Any, height: int, width: int) -> Any:
-    """Packed (1, lH*lW, 64) → NHWC uint8 (1, H, W, 3) via TAEF1."""
+def _prep_taef1(latent: Any, height: int, width: int) -> Callable[[], Any]:
+    """Construct TAEF1 + unpack (UN-timed); return a thunk that decodes only.
+
+    Model construction and the latent unpack run here, outside the timed region. The unpack is
+    eval'd so it is not lazily deferred into the timed decode; the caller warms the thunk once
+    (materializing the lazy mmap-backed weights and JIT-compiling the kernels) before timing a
+    second, steady-state decode.
+    """
     import mlx.core as mx
     from mflux.models.flux.latent_creator.flux_latent_creator import FluxLatentCreator
 
@@ -283,11 +340,16 @@ def _decode_taef1(latent: Any, height: int, width: int) -> Any:
     taef = TAEF1.from_pretrained(include_encoder=False)
     unpacked_nchw = FluxLatentCreator.unpack_latents(latent, height=height, width=width)
     unpacked_nhwc = mx.transpose(unpacked_nchw, (0, 2, 3, 1))
-    return taef.decode_image(unpacked_nhwc)
+    mx.eval(unpacked_nhwc)
+    return lambda: taef.decode_image(unpacked_nhwc)
 
 
-def _decode_taef2(latent: Any, height: int, width: int, bn_mean: Any, bn_var: Any) -> Any:
-    """Packed (1, lH*lW, 128) → NHWC uint8 (1, H, W, 3) via TAEF2 with BN denorm."""
+def _prep_taef2(
+    latent: Any, height: int, width: int, bn_mean: Any, bn_var: Any
+) -> Callable[[], Any]:
+    """Construct TAEF2 + unpack (BN denorm, UN-timed); return a thunk that decodes only."""
+    import mlx.core as mx
+
     from mlx_taef.api import TAEF2
     from mlx_taef.integrations.mflux import unpack_flux2_latent
 
@@ -301,27 +363,32 @@ def _decode_taef2(latent: Any, height: int, width: int, bn_mean: Any, bn_var: An
         bn_mean=bn_mean,
         bn_var=bn_var,
     )
-    return taef.decode_image(unpacked)
+    mx.eval(unpacked)
+    return lambda: taef.decode_image(unpacked)
 
 
-def _decode_zimage(latent: Any, height: int, width: int) -> Any:
-    """Packed Z-Image in-loop latent (16, 1, h, w) → NHWC uint8 (1, H, W, 3) via ZImage TAEF.
+def _prep_zimage(latent: Any, height: int, width: int) -> Callable[[], Any]:
+    """Construct ZImage TAEF + unpack (UN-timed); return a thunk that decodes only.
 
-    Returns `decode_image()` directly — it already produces uint8 NHWC.
+    The decode thunk returns `decode_image()` directly — it already produces uint8 NHWC.
     Do NOT pass through `_decoded_to_uint8_nhwc` (that helper is for full-VAE NCHW [-1,1]
     tensors and would transpose/renormalize uint8 into garbage).
     """
+    import mlx.core as mx
+
     from mlx_taef import ZImage
     from mlx_taef.kernels import UnpackContext
     from mlx_taef.kernels.zimage import unpack_zimage_latent
 
     taef = ZImage.from_pretrained(include_encoder=False)
     ctx = UnpackContext(latent_height=height // 8, latent_width=width // 8)
-    return taef.decode_image(unpack_zimage_latent(latent, ctx))  # already uint8 NHWC (1,H,W,3)
+    unpacked = unpack_zimage_latent(latent, ctx)
+    mx.eval(unpacked)
+    return lambda: taef.decode_image(unpacked)  # already uint8 NHWC (1,H,W,3)
 
 
-def _decode_full_vae_zimage(latent: Any, height: int, width: int) -> Any:
-    """Packed Z-Image latent → full mflux Z-Image VAE decode → NHWC uint8 image."""
+def _prep_full_vae_zimage(latent: Any, height: int, width: int) -> Callable[[], Any]:
+    """Construct full mflux Z-Image VAE + unpack (UN-timed); thunk decodes → NHWC uint8."""
     import mlx.core as mx
     from mflux.models.common.config.model_config import ModelConfig
     from mflux.models.common.vae.vae_util import VAEUtil
@@ -330,24 +397,27 @@ def _decode_full_vae_zimage(latent: Any, height: int, width: int) -> Any:
 
     model = MfluxZImage(quantize=4, model_config=ModelConfig.z_image_turbo())
     unpacked = ZImageLatentCreator.unpack_latents(latent, height, width)
-    decoded = VAEUtil.decode(vae=model.vae, latent=unpacked, tiling_config=None)
-    mx.eval(decoded)
-    return _decoded_to_uint8_nhwc(decoded)
+    mx.eval(unpacked)
+    return lambda: _decoded_to_uint8_nhwc(
+        VAEUtil.decode(vae=model.vae, latent=unpacked, tiling_config=None)
+    )
 
 
-def _decode_full_vae_flux1(latent: Any, height: int, width: int) -> Any:
-    """Packed → full FLUX.1 VAE decode → NHWC uint8 image."""
+def _prep_full_vae_flux1(latent: Any, height: int, width: int) -> Callable[[], Any]:
+    """Construct full FLUX.1 VAE + unpack (UN-timed); thunk decodes → NHWC uint8."""
+    import mlx.core as mx
     from mflux.models.flux.latent_creator.flux_latent_creator import FluxLatentCreator
     from mflux.models.flux.variants.txt2img.flux import Flux1
 
     flux = Flux1.from_name("dev", quantize=4)
     unpacked = FluxLatentCreator.unpack_latents(latent, height=height, width=width)
-    decoded = flux.vae.decode(unpacked)
-    return _decoded_to_uint8_nhwc(decoded)
+    mx.eval(unpacked)
+    return lambda: _decoded_to_uint8_nhwc(flux.vae.decode(unpacked))
 
 
-def _decode_full_vae_flux2(latent: Any, height: int, width: int) -> Any:
-    """Packed → full FLUX.2 Klein VAE decode → NHWC uint8 image."""
+def _prep_full_vae_flux2(latent: Any, height: int, width: int) -> Callable[[], Any]:
+    """Construct full FLUX.2 Klein VAE + unpack (UN-timed); thunk decodes → NHWC uint8."""
+    import mlx.core as mx
     from mflux.models.common.config.model_config import ModelConfig
     from mflux.models.flux2.variants.txt2img.flux2_klein import Flux2Klein
 
@@ -357,8 +427,8 @@ def _decode_full_vae_flux2(latent: Any, height: int, width: int) -> Any:
     packed_nchw = latent.reshape(latent.shape[0], latent_h, latent_w, latent.shape[-1]).transpose(
         0, 3, 1, 2
     )
-    decoded = flux.vae.decode_packed_latents(packed_nchw)
-    return _decoded_to_uint8_nhwc(decoded)
+    mx.eval(packed_nchw)
+    return lambda: _decoded_to_uint8_nhwc(flux.vae.decode_packed_latents(packed_nchw))
 
 
 def _decoded_to_uint8_nhwc(decoded: Any) -> Any:
@@ -384,44 +454,64 @@ def _save_webp(image_uint8_nhwc: Any, target: Path) -> None:
 
 
 def _worker_main(args: argparse.Namespace) -> int:
-    """Run one (condition, rep) inside this subprocess. Emit sentinel."""
+    """Run one (condition, rep) inside this subprocess. Emit sentinel.
+
+    Installs the same active-memory watchdog the live-scenario worker path uses
+    (scripts.run_showcase._install_live_watchdog) around model construction + decode, so
+    a rep that would otherwise page-storm the machine aborts with an honest artifact
+    (see _watchdog_abort_path) and a nonzero exit instead of risking a kernel panic.
+    Deferred import: run_showcase.py imports this module at its own top level, so
+    importing it back at bench_decode's module level would cycle.
+    """
+    # Drop any stale abort artifact from a prior rep at this save-to path before doing any
+    # real work — otherwise a THIS-rep crash unrelated to the watchdog would be misreported
+    # by _run_one_rep as "watchdog aborted" just because the file happens to still exist.
+    _watchdog_abort_path(args.save_to).unlink(missing_ok=True)
     installed_cap_gb = _install_memory_caps(args.applied_cap_gb)
 
-    import mlx.core as mx
+    from scripts.run_showcase import _install_live_watchdog
 
-    arrays = mx.load(str(args.latent))
-    latent = arrays["latent"]
-    height = int(arrays["height"].item())
-    width = int(arrays["width"].item())
-    bn_mean = arrays.get("bn_mean")
-    bn_var = arrays.get("bn_var")
+    watchdog = _install_live_watchdog(
+        _watchdog_abort_path(args.save_to),
+        f"{args.condition}_rep{args.rep}",
+        wall_budget_s=_worker_wall_budget_s(args.condition),
+    )
+    try:
+        import mlx.core as mx
 
-    mx.reset_peak_memory()
-    t0 = time.perf_counter()
-    if args.condition == "taef1":
-        image = _decode_taef1(latent, height, width)
-    elif args.condition == "taef2":
-        if bn_mean is None or bn_var is None:
-            raise TaefError("taef2 condition requires bn_mean+bn_var in the latent safetensors")
-        image = _decode_taef2(latent, height, width, bn_mean, bn_var)
-    elif args.condition == "zimage":
-        image = _decode_zimage(latent, height, width)
-    elif args.condition == "vanilla_vae":
-        if args.flux_variant == "flux1-dev":
-            image = _decode_full_vae_flux1(latent, height, width)
-        elif args.flux_variant == "flux2-klein-base-4b":
-            image = _decode_full_vae_flux2(latent, height, width)
-        elif args.flux_variant == "z-image-turbo":
-            image = _decode_full_vae_zimage(latent, height, width)
+        arrays = mx.load(str(args.latent))
+        latent = arrays["latent"]
+        height = int(arrays["height"].item())
+        width = int(arrays["width"].item())
+        bn_mean = arrays.get("bn_mean")
+        bn_var = arrays.get("bn_var")
+
+        # Setup (UN-timed): construct the model + unpack the latent.
+        if args.condition == "taef1":
+            decode_fn = _prep_taef1(latent, height, width)
+        elif args.condition == "taef2":
+            if bn_mean is None or bn_var is None:
+                raise TaefError("taef2 condition requires bn_mean+bn_var in the latent safetensors")
+            decode_fn = _prep_taef2(latent, height, width, bn_mean, bn_var)
+        elif args.condition == "zimage":
+            decode_fn = _prep_zimage(latent, height, width)
+        elif args.condition == "vanilla_vae":
+            if args.flux_variant == "flux1-dev":
+                decode_fn = _prep_full_vae_flux1(latent, height, width)
+            elif args.flux_variant == "flux2-klein-base-4b":
+                decode_fn = _prep_full_vae_flux2(latent, height, width)
+            elif args.flux_variant == "z-image-turbo":
+                decode_fn = _prep_full_vae_zimage(latent, height, width)
+            else:  # pragma: no cover
+                raise TaefError(f"unknown flux_variant: {args.flux_variant!r}")
         else:  # pragma: no cover
-            raise TaefError(f"unknown flux_variant: {args.flux_variant!r}")
-    else:  # pragma: no cover
-        raise TaefError(f"unknown condition: {args.condition!r}")
-    mx.eval(image)
-    elapsed_s = time.perf_counter() - t0
-    peak_gb = mx.get_peak_memory() / 1024**3
+            raise TaefError(f"unknown condition: {args.condition!r}")
 
-    _save_webp(image, args.save_to)
+        image, elapsed_s, peak_gb = _measure_steady_state(decode_fn)
+
+        _save_webp(image, args.save_to)
+    finally:
+        watchdog.stop()
 
     print(
         _emit_sentinel(
@@ -431,13 +521,27 @@ def _worker_main(args: argparse.Namespace) -> int:
                 "status": "ok",
                 "elapsed_s": elapsed_s,
                 "peak_memory_gb": peak_gb,
-                "image_path": str(args.save_to),
+                "image_path": _repo_relative(args.save_to),
                 "requested_cap_gb": args.applied_cap_gb,
                 "installed_cap_gb": installed_cap_gb,
             }
         )
     )
     return 0
+
+
+def _measure_steady_state(decode_fn: Callable[[], Any]) -> tuple[Any, float, float]:
+    """Warm once, then time and measure the second decode in steady state."""
+    import mlx.core as mx
+
+    mx.eval(decode_fn())
+    mx.reset_peak_memory()
+    t0 = time.perf_counter()
+    image = decode_fn()
+    mx.eval(image)
+    elapsed_s = time.perf_counter() - t0
+    peak_gb = mx.get_peak_memory() / 1024**3
+    return image, elapsed_s, peak_gb
 
 
 def main(argv: list[str] | None = None) -> int:

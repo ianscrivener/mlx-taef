@@ -11,6 +11,14 @@ def test_unpack_flux1_rejects_non_64_channels():
         unpack_flux1_latent(mx.zeros((1, 16, 16)), UnpackContext(latent_height=4, latent_width=4))
 
 
+def test_flux_unpacks_reject_sequence_length_mismatch() -> None:
+    ctx = UnpackContext(latent_height=2, latent_width=3)
+    with pytest.raises(ValueError, match=r"expected 6.*got 5"):
+        unpack_flux1_latent(mx.zeros((1, 5, 64)), ctx)
+    with pytest.raises(ValueError, match=r"expected 6.*got 5"):
+        unpack_flux2_latent(mx.zeros((1, 5, 128)), ctx)
+
+
 def test_unpack_flux1_matches_mflux_unpack_latents_oracle():
     pytest.importorskip("mflux")
     from mflux.models.flux.latent_creator.flux_latent_creator import FluxLatentCreator
@@ -35,8 +43,20 @@ def test_unpack_flux2_value_routing():
 
 
 def test_binding_dispatch_routes_each_model_to_its_unpack():
+    from mlx_taef.kernels.qwen import unpack_qwen_latent
+    from mlx_taef.kernels.zimage import unpack_zimage_latent
+
     assert get_kernel("taef1").integration.unpack is unpack_flux1_latent
     assert get_kernel("taef2").integration.unpack is unpack_flux2_latent
+    assert get_kernel("zimage").integration.unpack is unpack_zimage_latent
+    assert get_kernel("qwen-image").integration.unpack is unpack_qwen_latent
+
+
+def test_krea2_kernel_binding_uses_krea2_unpack():
+    from mlx_taef.kernels import get_kernel
+    from mlx_taef.kernels.krea2 import unpack_krea2_latent
+
+    assert get_kernel("krea2").integration.unpack is unpack_krea2_latent
 
 
 def test_flux1_callback_end_to_end_writes_preview(monkeypatch, tmp_path):
@@ -62,4 +82,4 @@ def test_flux1_callback_end_to_end_writes_preview(monkeypatch, tmp_path):
     cb.call_in_loop(t=0, seed=0, prompt="x", latents=packed, config=None, time_steps=None)
     out = tmp_path / "p.png"
     assert out.exists()
-    assert out.stat().st_size > 0
+    assert out.stat().st_size > 100  # a truncated/empty PNG (no real image data) would red this

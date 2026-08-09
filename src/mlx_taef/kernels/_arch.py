@@ -9,6 +9,7 @@ from collections.abc import Callable
 
 import mlx.nn as nn
 
+from mlx_taef.errors import UnknownArchitectureError
 from mlx_taef.model import Block, Clamp, make_conv
 
 
@@ -59,8 +60,23 @@ def _build_taesd2d_encoder(latent_channels: int, *, midblock_gn: bool) -> "nn.Se
     return nn.Sequential(*layers)  # type: ignore[attr-defined]
 
 
+def _build_taehv_decoder(latent_channels: int, *, midblock_gn: bool) -> "nn.Sequential":  # type: ignore[name-defined]
+    """Build the taew2.1 (taehv) decoder. `midblock_gn` is accepted for the uniform call site but unused."""
+    from mlx_taef.kernels._taehv import TaehvDecoder
+
+    return TaehvDecoder(latent_channels=latent_channels)
+
+
+def _build_taehv_encoder(latent_channels: int, *, midblock_gn: bool) -> "nn.Sequential":  # type: ignore[name-defined]
+    """Build the taew2.1 (taehv) encoder. `midblock_gn` is accepted for the uniform call site but unused."""
+    from mlx_taef.kernels._taehv import TaehvEncoder
+
+    return TaehvEncoder(latent_channels=latent_channels)
+
+
 ARCH_BUILDERS: dict[str, dict[str, Callable[..., nn.Sequential]]] = {  # type: ignore[name-defined]
     "taesd2d": {"decoder": _build_taesd2d_decoder, "encoder": _build_taesd2d_encoder},
+    "taehv": {"decoder": _build_taehv_decoder, "encoder": _build_taehv_encoder},
 }
 
 
@@ -71,5 +87,5 @@ def build_arch(
     try:
         builder = ARCH_BUILDERS[arch_name][role]
     except KeyError as e:
-        raise KeyError(f"unknown arch/role: {arch_name!r}/{role!r}") from e
+        raise UnknownArchitectureError(f"unknown arch/role: {arch_name!r}/{role!r}") from e
     return builder(latent_channels, midblock_gn=midblock_gn)

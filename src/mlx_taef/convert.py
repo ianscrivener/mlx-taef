@@ -6,12 +6,14 @@ and writes MLX safetensors directly. Runtime users never need torch.
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import mlx.core as mx
 import numpy as np
-from huggingface_hub import hf_hub_download
 from safetensors.numpy import load_file as safetensors_load_numpy
+
+if TYPE_CHECKING:
+    from mlx_taef.kernels._types import Role, WeightSource
 
 from mlx_taef.errors import ConversionError
 from mlx_taef.model import make_decoder
@@ -51,29 +53,64 @@ def convert_diffusers_to_sequential(
             if role == "decoder":
                 idx += 1
             new_key = f"{idx}." + ".".join(parts[2:])
-        else:  # pragma: no cover
-            new_key = suffix
+        else:
+            logger.debug("Skipping non-layers Diffusers key %s", k)
+            continue
         out[new_key] = v
     return out
 
 
-def _load_role_state_dict(  # pragma: no cover
+def _resolve_weight_source(config: TaesdVariantConfig) -> "WeightSource":
+    """Map a legacy config back to its registered kernel's pinned WeightSource.
+
+    A config whose (name, repo, filenames) match a registered kernel inherits that
+    kernel's revision + sha256 pins; anything else (a hand-built config, or a fork
+    that reuses a kernel name with a different repo) gets an ad-hoc unpinned source
+    rather than being verified against another checkpoint's digests.
+    """
+    from mlx_taef.kernels import KERNELS
+    from mlx_taef.kernels._types import WeightSource
+
+    kernel = KERNELS.get(config.name)
+    if kernel is not None and (
+        kernel.source.repo == config.hf_repo
+        and kernel.source.filename == config.hf_filename
+        and kernel.source.decoder_filename == config.hf_decoder_filename
+        and kernel.source.encoder_filename == config.hf_encoder_filename
+    ):
+        return kernel.source
+    return WeightSource(
+        repo=config.hf_repo,
+        filename=config.hf_filename,
+        decoder_filename=config.hf_decoder_filename,
+        encoder_filename=config.hf_encoder_filename,
+    )
+
+
+def _load_role_state_dict(
     config: TaesdVariantConfig,
     role: str,
 ) -> dict[str, np.ndarray]:
-    """Download and load weights for (variant, role) into a Sequential-keyed dict."""
+    """Download and load weights for (variant, role) into a Sequential-keyed dict.
+
+    Downloads route through the kernel system's pinned, sha-verified path, so the
+    built-in configs get the same revision + digest enforcement as `from_pretrained`.
+    """
+    from mlx_taef.kernels._conversion import _download_and_verify
+
+    source = _resolve_weight_source(config)
     if config.key_format == "diffusers":
         if config.hf_filename is None:
             raise ValueError(f"Diffusers variant {config.name!r} has no hf_filename")
-        path = hf_hub_download(repo_id=config.hf_repo, filename=config.hf_filename)
-        full_sd = safetensors_load_numpy(path)
-        return convert_diffusers_to_sequential(full_sd, role=role)
+        path = _download_and_verify(source, config.hf_filename, role=cast("Role", role))
+        full_sd = safetensors_load_numpy(path)  # pragma: no cover - needs network
+        return convert_diffusers_to_sequential(full_sd, role=role)  # pragma: no cover
     if config.key_format == "upstream":
         filename = config.hf_decoder_filename if role == "decoder" else config.hf_encoder_filename
         if filename is None:
             raise ValueError(f"Upstream variant {config.name!r} has no {role} filename")
-        path = hf_hub_download(repo_id=config.hf_repo, filename=filename)
-        return safetensors_load_numpy(path)
+        path = _download_and_verify(source, filename, role=cast("Role", role))
+        return safetensors_load_numpy(path)  # pragma: no cover - needs network
     raise ValueError(f"Unknown key_format: {config.key_format!r}")
 
 
@@ -141,14 +178,10 @@ def _build_mlx_state_dict(
             # Skip keys that don't map to the MLX module structure
             # (e.g., extra Diffusers-specific keys we don't need)
             continue
-        # Conv2d weight transpose NCHW (out, in, kH, kW) -> NHWC (out, kH, kW, in)
-        # Detected when source is 4D and expected MLX shape matches the transposed shape.
-        if arr.ndim == 4 and expected_shapes[dst_key] == (
-            arr.shape[0],
-            arr.shape[2],
-            arr.shape[3],
-            arr.shape[1],
-        ):
+        # Every supported 4-D source parameter is a Conv2d weight. Transpose NCHW
+        # (out,in,kH,kW) -> MLX NHWC (out,kH,kW,in) unconditionally; shape-based detection
+        # is ambiguous for the encoder's collision-shaped (out,3,3,3) convolution.
+        if arr.ndim == 4:
             arr = np.transpose(arr, (0, 2, 3, 1)).copy()
         converted[dst_key] = mx.array(arr)
     _verify_conversion_coverage(converted, expected_shapes)

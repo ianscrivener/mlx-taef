@@ -55,15 +55,15 @@ def test_fixture_latent_missing_subclasses_taef_error_and_file_not_found() -> No
 def test_errors_reexported_from_package_root_by_identity() -> None:
     """Re-export must be the SAME object. The old `is not None` check would
     pass a wrong-object or `True` alias; identity catches a broken re-export.
-    Includes ConversionError, which the old check omitted entirely."""
+    Covers the errors raised by importable package code (the three showcase-only
+    exceptions are intentionally NOT root-exported — see
+    test_showcase_only_exceptions_not_in_package_root_all)."""
     import mlx_taef
     from mlx_taef import errors
 
     assert mlx_taef.TaefError is errors.TaefError
-    assert mlx_taef.SchemaVersionError is errors.SchemaVersionError
     assert mlx_taef.ConversionError is errors.ConversionError
-    assert mlx_taef.MlxTeacacheNotInstalledError is errors.MlxTeacacheNotInstalledError
-    assert mlx_taef.FixtureLatentMissingError is errors.FixtureLatentMissingError
+    assert mlx_taef.UnknownKernelError is errors.UnknownKernelError
     assert mlx_taef.MfluxNotInstalledError is errors.MfluxNotInstalledError
 
 
@@ -142,6 +142,19 @@ def test_unknown_kernel_error_hierarchy():
     assert issubclass(UnknownKernelError, KeyError)
 
 
+def test_unknown_kernel_error_string_has_no_keyerror_outer_quotes() -> None:
+    from mlx_taef.errors import UnknownKernelError
+
+    assert str(UnknownKernelError("unknown kernel: 'missing'")) == "unknown kernel: 'missing'"
+
+
+def test_unknown_architecture_error_hierarchy() -> None:
+    from mlx_taef.errors import TaefError, UnknownArchitectureError
+
+    assert issubclass(UnknownArchitectureError, TaefError)
+    assert issubclass(UnknownArchitectureError, KeyError)
+
+
 def test_mflux_not_installed_error_is_taef_and_import_error() -> None:
     from mlx_taef.errors import MfluxNotInstalledError, TaefError
 
@@ -158,6 +171,39 @@ def test_mflux_not_installed_error_exported_from_root() -> None:
     assert mlx_taef.MfluxNotInstalledError is errors.MfluxNotInstalledError
 
 
+def test_mflux_not_installed_error_raised_when_mflux_import_fails(monkeypatch) -> None:
+    """Raise-condition: importing the integration with mflux absent must raise
+    MfluxNotInstalledError, not a bare ImportError. Drives the real module-level guard at
+    integrations/mflux.py (which is `# pragma: no cover` because mflux is present in dev)."""
+    import importlib
+    import sys
+
+    from mlx_taef.errors import MfluxNotInstalledError
+
+    # Make importing `mflux.callbacks.callback` fail at import time.
+    monkeypatch.setitem(sys.modules, "mflux.callbacks.callback", None)
+    monkeypatch.delitem(sys.modules, "mlx_taef.integrations.mflux", raising=False)
+    with pytest.raises(MfluxNotInstalledError):
+        importlib.import_module("mlx_taef.integrations.mflux")
+
+
+def test_showcase_only_exceptions_not_in_package_root_all() -> None:
+    """Showcase/bench-only exceptions are not part of the supported public surface,
+    but remain importable from mlx_taef.errors for the scripts that raise them."""
+    import mlx_taef
+    from mlx_taef import errors
+
+    showcase_only = (
+        "SchemaVersionError",
+        "FixtureLatentMissingError",
+        "MlxTeacacheNotInstalledError",
+    )
+    for name in showcase_only:
+        assert name not in mlx_taef.__all__, f"{name} should not be in the package-root __all__"
+        assert not hasattr(mlx_taef, name), f"{name} should not be a package-root attribute"
+        assert hasattr(errors, name), f"{name} must stay importable from mlx_taef.errors"
+
+
 def test_no_docstring_references_a_nonexistent_exception() -> None:
     import mlx_taef.errors as errmod
 
@@ -167,3 +213,9 @@ def test_no_docstring_references_a_nonexistent_exception() -> None:
         if isinstance(obj, type):
             blob += obj.__doc__ or ""
     assert "TaefMfluxNotInstalledError" not in blob
+
+
+def test_unknown_architecture_error_string_has_no_keyerror_outer_quotes() -> None:
+    from mlx_taef.errors import UnknownArchitectureError
+
+    assert str(UnknownArchitectureError("unknown arch: 'missing'")) == "unknown arch: 'missing'"

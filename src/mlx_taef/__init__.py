@@ -2,14 +2,12 @@
 
 import logging
 
-from mlx_taef.api import TAEF1, TAEF2, TAESD, TAESDXL, Taef, ZImage
+from mlx_taef.api import TAEF1, TAEF2, TAESD, TAESDXL, Krea2, QwenImage, Taef, ZImage
 from mlx_taef.errors import (
     ConversionError,
-    FixtureLatentMissingError,
     MfluxNotInstalledError,
-    MlxTeacacheNotInstalledError,
-    SchemaVersionError,
     TaefError,
+    UnknownArchitectureError,
     UnknownKernelError,
 )
 from mlx_taef.variants import get_memory_cap_hint
@@ -20,12 +18,12 @@ __all__ = [
     "TAESD",
     "TAESDXL",
     "ConversionError",
-    "FixtureLatentMissingError",
+    "Krea2",
     "MfluxNotInstalledError",
-    "MlxTeacacheNotInstalledError",
-    "SchemaVersionError",
+    "QwenImage",
     "Taef",
     "TaefError",
+    "UnknownArchitectureError",
     "UnknownKernelError",
     "ZImage",
     "get_memory_cap_hint",

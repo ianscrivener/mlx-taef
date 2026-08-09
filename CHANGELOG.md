@@ -5,11 +5,222 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-08-09
+
+Krea 2 Turbo live preview.
+
+### Added
+- `Krea2` decodes Krea 2 Turbo latents. Krea 2 generates on the Qwen-Image stack and shares its
+  Wan 2.1 VAE, so this variant reuses the taew2.1 weights already converted for `QwenImage` — one
+  shared converted-cache entry, no new download. Construct it with `Krea2.from_pretrained()`, or
+  preview a live generation with `LivePreviewCallback(variant="krea2")`. Adds
+  `mlx-taef bench --variant krea2`. Decode quality against mflux's full Krea 2 VAE is gated by an
+  opt-in SSIM check on a committed fixture (measured 0.9678, floor 0.75).
+- The showcase report and COMPARISON.md now carry LPIPS alongside SSIM for every decode scenario.
+  LPIPS is a learned perceptual distance (lower is better) and catches artifacts SSIM's structural
+  comparison under-weights.
+
+### Changed
+- `mlx-teacache`, used by the `showcase` extra and the `test` dependency group, now installs on
+  Python 3.10 as well as 3.11+, since mlx-teacache 0.9.3 dropped its own 3.11 floor. The combined
+  showcase scenario and its tests now run on every Python version this project supports.
+- `ZImage.encode()` is now validated the same way decode already was: an opt-in cross-roundtrip
+  test (TAEF1 encode into the full Z-Image VAE's decoder) measures SSIM 0.9580 against the same
+  0.75 floor.
+- The live-preview integration is verified against mflux 0.18.1: the callback contract, the
+  packed-latent layouts, and the batch-norm stats the auto-bn path reads are unchanged, so
+  `mlx-taef[mflux]` needs no code changes. The `mflux` extra pin stays `>=0.17,<0.19`.
+- Every model-loading showcase and benchmark subprocess, not only the three live-generation
+  workers, now runs under the active-memory watchdog. A decode-only rep that starts paging aborts
+  with an honest artifact instead of risking the machine.
+- CI's dependency groups are now installed in isolation (`[tool.uv] default-groups = []`): each
+  job's `uv sync --frozen --group <name>` installs exactly that group instead of also pulling in
+  uv's implicit default group. This uncovered a missing Pillow dependency in the `typecheck`
+  group — `mypy --strict` needs PIL's types to check `integrations/mflux.py` — now declared there
+  directly.
+
+### Internal
+- The README links a live-preview GIF near the top: TAEF1 previews animating step by step next to
+  the finished full-VAE decode held static, generated with the new `scripts/make_preview_gif.py`.
+
+## [0.7.1] - 2026-07-25
+
+### Changed
+
+- Python 3.10 is now supported (`requires-python` drops from `>=3.11` to `>=3.10`). The CI test
+  matrix runs 3.10 through 3.14, so every advertised version is exercised by the full offline
+  suite, including the bit-exact parity fixtures. On 3.10 the `Self` return types come from
+  `typing-extensions`, which installs automatically on that version only.
+- The `showcase` extra and the `test` group install `mlx-teacache` only on Python 3.11+, since it
+  requires 3.11. Everything else in both, and all of the runtime dependencies, work on 3.10; the
+  showcase's combined scenario already reports a clear error when `mlx-teacache` is absent.
+
+## [0.7.0] - 2026-07-24
+
+This release makes live previews resilient to runtime errors and closes the remaining hardening work across downloads, conversion, errors, and the benchmark harness.
+
+### Added
+- `LivePreviewCallback(..., on_error="disable" | "raise")` controls runtime preview failures. The default logs one warning and disables previews for the rest of the current generation, so a preview problem does not discard a long-running image. Strict integrations can use `on_error="raise"` to keep the previous fail-fast behavior.
+- Every built-in Hugging Face weight file now has an immutable revision and role-specific sha256 pin. The opt-in network test downloads, verifies, converts, and loads every decoder and encoder source through the runtime path.
+- `UnknownArchitectureError` gives architecture lookup failures the same clean, package-rooted error surface as unknown variants.
+
+### Fixed
+- TAEF2 auto-BN now respects the VAE's epsilon, rejects incomplete explicit BN pairs, and warns when `auto_bn` cannot resolve stats. FLUX.1, FLUX.2, and Qwen packed-latent unpacking now validates the sequence length before reshape.
+- A live-preview decode or file-write failure no longer terminates a generation under the default callback policy. Callback state resets on the next generation.
+- Four-dimensional convolution weights are always transposed during conversion. Ambiguous equal-sized channel dimensions can no longer skip the required layout change.
+- `UnknownKernelError` and `UnknownArchitectureError` render without `KeyError`'s extra quote layer. Direct `Taef()` construction, memory-cap lookup, and `mlx-taef info` failures now return clear, stable errors.
+- The documented direct invocation of `scripts/diff_showcase_report.py` works from any current directory.
+- `mlx-taef convert` now uses the kernel registry and the runtime download cache, so its downloads enforce the same immutable revision and sha256 checks as `from_pretrained()`.
+- The showcase command exits nonzero if any scenario fails after checkpointing the remaining results. Decode medians now require every requested repetition, and live scenarios require one non-empty preview per inference step plus a non-empty final image.
+
+### Changed
+- Converted-weight cache keys include a converter-format version as well as the source revision and digest. The first load after this upgrade rebuilds each converted cache once. Converted cache directories are created with owner-only permissions.
+- CI installs from the lockfile with `uv sync --frozen` on every supported Python version.
+- Live showcase generations run in separate worker processes. Each worker has a 55-minute wall budget and a 28 GiB active-memory ceiling on the 32 GiB reference Mac, writes an abort record before exit, and leaves completed scenario results checkpointed. The report schema is now version 2 and records generation and tiny-decoder dtypes separately.
+- Benchmark metadata records both the source-derived git version and the installed distribution version. The report loader migrates the committed v0.6.2 schema when comparing releases, and the regression checker also guards the number of preview frames.
+- The benchmark report was re-measured on Apple M1 Max at commit `1e79c29`. All six scenarios completed with every requested repetition and preview frame, and the regression checker found no latency, memory, SSIM, TeaCache, or gallery regression against v0.6.2.
+
+### Internal
+- The kernel registry is the source of truth for mid-block GroupNorm and memory-cap metadata. The old `MIDBLOCK_GN` mapping remains as a derived compatibility view.
+- Small integration seams now have behavioral coverage for callback registration docs, numbered frames, missing bindings, error formatting, kernel metadata, CI lockfile use, and benchmark schema handling.
+
+## [0.6.2] — 2026-07-09
+
+A hardening and accuracy release. It hardens the live-preview callback and the converted-weight cache, and corrects the published decode-benchmark numbers after fixing how they were measured.
+
+### Fixed
+- The README's mflux live-preview quickstart called a `Flux2Klein` constructor that does not exist in any supported mflux version; it now uses the working `Flux2Klein(quantize=4, model_config=...)` form.
+- `LivePreviewCallback` rejects `every < 1` and a half-set BN pair (only `bn_mean` or only `bn_var`) at construction, rather than dividing by zero mid-generation or discarding the BN stats without a word.
+- `LivePreviewCallback` resets its step counter and frame gallery at the start of each generation. Reusing one callback across several `generate_image` calls no longer misaligns the `every` cadence or mixes preview frames from different runs.
+- The converted-weights cache key now includes a source's pinned revision and sha256, so bumping a pin re-converts instead of serving stale weights. Qwen-Image is the only pinned model today, so its users re-convert once on upgrade; the other models keep their existing cache.
+- Every conversion path now enforces a source's `revision` pin and, for single-file sources, verifies the `sha256`. Previously only the taew2.1 path did.
+
+### Changed
+- The decode benchmark now times the decode step at steady state, with model construction moved outside the timed window and one untimed warmup call before the clock starts. The tiny decoders run about 30 ms per step — the earlier releases' ~180–260 ms figure timed one-time model construction inside the decode window — for a **~8–10×** speedup over the full VAE decode. COMPARISON and EXAMPLES are re-measured, and the Z-Image decode and live-preview scenarios join the showcase.
+- The showcase harness writes its report after each scenario and records a failing scenario as an error instead of aborting the run. The report differ now flags a scenario or metric that vanishes between runs.
+
+### Internal
+- The `from_pretrained` `repo_id` mismatch guard is now tested; the latent-capture path is covered against the real mflux callback registry; shipped docstrings state the memory-cap constraint directly instead of pointing at a repo-local file; the local coverage gate matches CI at 95%.
+
+## [0.6.1] — 2026-06-30
+
+A maintenance release: a cache-corruption fix, Python 3.14 support, sharper public-API types, and a live-preview demo.
+
+### Added
+- Python 3.14 is now tested in CI and advertised in the package classifiers.
+- A short live-preview clip — TAEF1 decoding a FLUX.1-dev generation step by step — linked near the top of the README.
+
+### Fixed
+- Converted weights are written atomically (temp file + rename), so a run interrupted mid-download/convert can no longer leave a truncated file in the cache. (If an earlier version already left a corrupt cache file, clear it once with `rm -rf ~/.cache/mlx-taef/` — existing files are not auto-repaired.)
+
+### Changed
+- Factory constructors (`from_pretrained`, `from_pretrained_local`, `from_kernel`) are now typed to return the concrete subclass, and the decoder/encoder role and the preview variant are typed literals. Editor autocomplete and type-checking improve; runtime behavior is unchanged.
+- Internal: the test suite was hardened (parity-oracle integrity pinning, offline-by-default mflux tests).
+
+## [0.6.0] — 2026-06-23
+
+Qwen-Image live preview.
+
+### Added
+- `QwenImage` decodes Qwen-Image and Qwen-Image-Edit latents — the Wan 2.1 VAE's 16-channel
+  latent — with a pure-MLX port of madebyollin's taew2.1 tiny autoencoder. Construct it with
+  `QwenImage.from_pretrained()` for standalone decode/encode, or preview a live generation with
+  `LivePreviewCallback(variant="qwen-image")`. Adds `mlx-taef bench --variant qwen-image`.
+
+### Notes
+- Decode and encode match the upstream taew2.1 reference to within ~3e-6 (fp32, measured worst),
+  gated by committed parity fixtures for both paths.
+- taew2.1 is a different shape from the rest of the family: a 2D-conv autoencoder with recurrent
+  temporal blocks, run here for a single still image. It is the first variant on the new `taehv`
+  architecture.
+- The weights are a sha256-verified re-host of madebyollin's canonical taew2.1, which is published
+  on GitHub only; the kernel pins the file by its hash.
+- Live-preview quality against the full Wan VAE is community-measured: Qwen-Image is a ~20B model
+  that does not fit a usable resolution on 32 GB, so that comparison is not captured here.
+
+## [0.5.1] — 2026-06-20
+
+A compatibility release. No API or behavior changes.
+
+### Changed
+- The `mflux` extra now installs against mflux 0.18.x as well as 0.17.x. mflux 0.18.0
+  shipped after the previous pin, so the old `<0.18` bound left anyone already on 0.18
+  unable to install `mlx-taef[mflux]` without downgrading mflux. The pin is now
+  `>=0.17,<0.19`. The live-preview integration was verified against mflux 0.18.0: the
+  callback contract, the generation config the auto-resolution reads, the packed-latent
+  layout, and the Flux2VAE batch-norm stats the auto-bn path extracts are unchanged, so
+  no code needed to change.
+- The `showcase` extra moves its `mlx-teacache` pin to `>=0.9.1,<0.10`, the first
+  mlx-teacache release that supports mflux 0.18.x, so `mlx-taef[showcase]` stays coherent
+  on mflux 0.18.
+
+## [0.5.0] — 2026-06-18
+
+A live-preview ergonomics release.
+
+### Added
+- `LivePreviewCallback` auto-detects the preview resolution. Leave `latent_height` /
+  `latent_width` unset and the callback reads the image size from the mflux generation config at
+  run time, so a non-square or non-512 render previews correctly without you passing dimensions
+  by hand. Passing both dimensions still overrides the auto-detection.
+
+### Changed
+- `latent_height` / `latent_width` now default to `None` (auto-detect) instead of `32`. Callers
+  that pass both explicit dimensions are unaffected; callers that relied on the old `32` default
+  now get the right dimensions for their actual resolution. Passing exactly one of the two now
+  raises a `ValueError` (set both, or leave both to auto-detect); previously the unset one
+  silently fell back to `32`.
+- The auto-extracted Flux2VAE batch-norm `eps` is forwarded into the TAEF2 preview unpack, so a
+  VAE whose `eps` differs from the `1e-4` default previews faithfully.
+- `auto_bn=True` on a non-TAEF2 variant now logs that it is a no-op (it was silent before), and
+  the `auto_bn` / `latent_height` / `latent_width` arguments are documented on the callback.
+
+### Removed
+- `SchemaVersionError`, `FixtureLatentMissingError` and `MlxTeacacheNotInstalledError` are no
+  longer exported from the package root. They are raised only by the bundled showcase script and
+  remain importable from `mlx_taef.errors`.
+
+## [0.4.2] — 2026-06-14
+
+A small hardening patch.
+
+### Changed
+- `decode()` and `encode()` now reject inputs that aren't 4-D NHWC arrays, raising a `ValueError`
+  that names the expected rank instead of failing deep in the conv stack with an opaque error.
+  This closes a gap in the v0.3.1 channel-count guard, which a wrong-rank input could slip past
+  (for example a 3-D array whose last dimension happened to match the channel count).
+- The `mflux_live_preview` example now prints per-step TAEF2 decode timing next to the full
+  Flux2VAE final decode, so the preview-vs-full-VAE speed difference is visible when you run it.
+  Thanks to @ianscrivener (#20).
+
+### Internal
+- The release workflow's `actions/download-artifact` step moves to a Node 24 release (v8),
+  clearing the Node 20 deprecation warning.
+
+## [0.4.1] — 2026-06-14
+
+A documentation and packaging accuracy pass. No code or model behavior changes.
+
+### Changed
+- The Z-Image SSIM ≥ 0.75 calibration is now described correctly across the docs. It runs as an
+  opt-in network test (`pytest --run-network`), not in default CI, so the docs no longer call it
+  CI-gated.
+- The README's "no PyTorch" note is scoped to the base install. The optional `mflux` extra
+  follows mflux's dependency set, which currently includes PyTorch, so `mlx-taef[mflux]` brings
+  it in.
+
+### Fixed
+- The source distribution is now an allowlist of the package, user-facing docs, examples, and
+  license. It no longer ships the test suite without the parity fixtures those tests need, and a
+  local `uv build` can no longer sweep machine-local tool state or generated artifacts into the
+  archive. The wheel is unchanged (package-only).
+
 ## [0.4.0] — 2026-06-13
 
 Z-Image / Z-Image-Turbo support. Z-Image's VAE shares FLUX.1's 16-channel latent contract, so
 the existing TAEF1 decoder previews it with no new weights to download. Validated by an SSIM ≥
-0.75 calibration against mflux's full Z-Image VAE (measured 0.94), gated in CI.
+0.75 calibration against mflux's full Z-Image VAE (measured 0.94). That calibration runs as an
+opt-in network test (`pytest --run-network`), not in default CI.
 
 ### Added
 - `ZImage` — a model class for Z-Image / Z-Image-Turbo live preview. Reuses TAEF1's weights and
@@ -21,7 +232,8 @@ the existing TAEF1 decoder previews it with no new weights to download. Validate
   decode for each model, with captured frames and the measured cost of each decode.
 
 ### Notes
-- The validated path is decode / live preview (the SSIM calibration is a CI gate). `ZImage`
+- The validated path is decode / live preview (the SSIM calibration runs as an opt-in network
+  test, not in default CI). `ZImage`
   inherits `encode()`, which reuses the TAEF1 encoder on the shared latent contract; it is not
   separately validated against Z-Image's distinct VAE encoder, so encode / img2img is best-effort.
 - Measured on Apple M1 Max (32 GB), mflux 0.17.5 / MLX 0.31.2, int4: TAEF1 decodes a Z-Image
@@ -177,7 +389,7 @@ Headline measured results on M1 Max 32 GB (full table + reproducer in `COMPARISO
 - `LivePreviewCallback(numbered_frames=True)` — opt-in gallery mode that writes one image per step (`<stem>_step{NN}<ext>`) instead of overwriting a single path. Used by the v0.2.0 showcase to capture per-step progression; `callback.saved_paths` lists every written file.
 - `TaesdVariantConfig.memory_cap_hint_gb` field + `get_memory_cap_hint(variant)` helper. Per-variant defaults: `taesd`/`taesdxl` None, `taef1` 1 GB, `taef2` 2 GB. Re-exported in `mlx_taef.__all__`.
 - New exception classes in `src/mlx_taef/errors.py`: `TaefError` (root), `SchemaVersionError`, `MlxTeacacheNotInstalledError`, `FixtureLatentMissingError`. All re-exported in `mlx_taef.__all__`.
-- `mlx_taef._memory_caps` — device-aware wired+memory cap helper. Computes `(wired_gb, memory_gb)` from `mx.device_info()["max_recommended_working_set_size"]` and clamps the CLAUDE.md targets (20 GB / 22 GB) below the device ceiling. On a 32 GB M1 Max it returns `(20, 22)` unchanged; on smaller CI runners it returns a smaller pair so `set_wired_limit` won't raise.
+- `mlx_taef._memory_caps` — device-aware wired+memory cap helper. Computes `(wired_gb, memory_gb)` from `mx.device_info()["max_recommended_working_set_size"]` and clamps the 20 GB / 22 GB targets below the device ceiling. On a 32 GB M1 Max it returns `(20, 22)` unchanged; on smaller CI runners it returns a smaller pair so `set_wired_limit` won't raise.
 - `tests/conftest.py` session-level memory caps installed via the new `_memory_caps` helper (hardware-aware, not fixed 20/22 GB).
 - `scripts/_caps.py` with `FULL_VAE_CAP_GB` shared constant (per-flux-variant cap for full-VAE baseline workers).
 - `scripts/_capture_latent.py` — one-shot fixture-latent capture with sha256 sidecar.

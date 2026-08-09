@@ -24,11 +24,11 @@ def test_weightsource_cache_key_always_includes_role():
     )
     assert (
         diffusers.cache_key(role="decoder")
-        == "madebyollin_taef1__diffusion_pytorch_model.safetensors__decoder"
+        == "madebyollin_taef1__diffusion_pytorch_model.safetensors__decoder__converter-v1"
     )
     assert (
         diffusers.cache_key(role="encoder")
-        == "madebyollin_taef1__diffusion_pytorch_model.safetensors__encoder"
+        == "madebyollin_taef1__diffusion_pytorch_model.safetensors__encoder__converter-v1"
     )
     assert diffusers.cache_key(role="decoder") != diffusers.cache_key(role="encoder")
     upstream = WeightSource(
@@ -38,11 +38,11 @@ def test_weightsource_cache_key_always_includes_role():
     )
     assert (
         upstream.cache_key(role="decoder")
-        == "madebyollin_taesd__taesd_decoder.safetensors__decoder"
+        == "madebyollin_taesd__taesd_decoder.safetensors__decoder__converter-v1"
     )
     assert (
         upstream.cache_key(role="encoder")
-        == "madebyollin_taesd__taesd_encoder.safetensors__encoder"
+        == "madebyollin_taesd__taesd_encoder.safetensors__encoder__converter-v1"
     )
 
 
@@ -74,3 +74,27 @@ def test_modelkernel_composes_strategies():
     assert k.latent.channels == 16
     out = k.integration.unpack(mx.zeros((1,)), UnpackContext(latent_height=1, latent_width=1))
     assert out.shape == (1,)
+
+
+def test_role_is_exported_with_the_two_roles():
+    from typing import get_args
+
+    from mlx_taef.kernels import Role
+
+    assert get_args(Role) == ("decoder", "encoder")
+
+
+def test_cache_key_tracks_converter_version_constant(monkeypatch) -> None:
+    """cache_key must interpolate CONVERTER_VERSION, so bumping it invalidates caches."""
+    from mlx_taef.kernels import _types
+    from mlx_taef.kernels._types import WeightSource
+
+    source = WeightSource(repo="acme/models", filename="weights.safetensors")
+    before = source.cache_key(role="decoder")
+    assert f"converter-v{_types.CONVERTER_VERSION}" in before
+
+    monkeypatch.setattr(_types, "CONVERTER_VERSION", 99)
+    after = source.cache_key(role="decoder")
+
+    assert "converter-v99" in after
+    assert after != before

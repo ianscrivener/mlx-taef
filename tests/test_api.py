@@ -36,7 +36,15 @@ def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
 
 def test_taef2_loads_from_local_path() -> None:
     taef2 = TAEF2.from_pretrained_local(CONVERTED_DIR / "taef2_decoder.safetensors")
-    assert taef2 is not None
+    # 32-channel FLUX.2 latent must reach the decoder's first conv (layers[1]).
+    assert taef2.decoder.layers[1].weight.shape[-1] == 32
+
+
+def test_direct_taef_construction_raises_guided_package_error() -> None:
+    from mlx_taef.errors import TaefError
+
+    with pytest.raises(TaefError, match=r"TAEF1|from_kernel"):
+        Taef()
 
 
 def test_taef2_decode_produces_correct_shape() -> None:
@@ -137,3 +145,10 @@ def test_decode_parity_gate_rejects_brightness_shift() -> None:
     assert _cosine_sim(out, shifted_ref) > 0.999  # old gate would have passed this
     with pytest.raises(AssertionError):
         np.testing.assert_allclose(out, shifted_ref, atol=DECODE_ATOL, rtol=0)
+
+
+def test_from_pretrained_rejects_repo_id_mismatch() -> None:
+    """from_pretrained(repo_id=...) validates against the kernel's own repo BEFORE any
+    download, so a mismatch raises offline. Documented behavior, previously untested."""
+    with pytest.raises(ValueError, match="repo_id mismatch"):
+        TAEF1.from_pretrained(repo_id="not/the-real-repo")
